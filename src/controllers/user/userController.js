@@ -16,8 +16,15 @@ const ALLOWED_FIELDS = new Set([
 
 const PATTERNS = {
   username: /^[a-z0-9_\-.]{3,50}$/,
-  email:    /^[^\s@]+@[^\s@]+\.[^\s@]+$/,
-  password: /^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[!@#$%^&*()_+\-=[\]{};':"\\|,.<>/?]).{8,}$/,
+  email: /^[^\s@]+@[^\s@]+\.[^\s@]+$/,
+  password:
+    /^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[!@#$%^&*()_+\-=[\]{};':"\\|,.<>/?]).{8,}$/,
+};
+
+const resolveIdentifierType = (identifier) => {
+  if (PATTERNS.email.test(identifier)) return "email";
+  if (PATTERNS.username.test(identifier)) return "username";
+  return null;
 };
 
 const isValidString = (value) =>
@@ -52,8 +59,8 @@ export const registerUser = async (req, res) => {
       username,
       email,
       password,
-      full_name    = null,
-      website_url  = null,
+      full_name = null,
+      website_url = null,
       is_admin_panel = "no",
     } = body;
 
@@ -91,11 +98,11 @@ export const registerUser = async (req, res) => {
       website_url = normalised;
     }
 
-    username   = username.trim().toLowerCase();
-    email      = email.trim().toLowerCase();
-    password   = password.trim();
-    full_name  = isValidString(full_name)  ? full_name.trim()  : null;
-    website_url = website_url               ? website_url        : null;
+    username = username.trim().toLowerCase();
+    email = email.trim().toLowerCase();
+    password = password.trim();
+    full_name = isValidString(full_name) ? full_name.trim() : null;
+    website_url = website_url ? website_url : null;
 
     const userRole = is_admin_panel === "yes" ? "Admin" : "User";
 
@@ -141,7 +148,9 @@ export const registerUser = async (req, res) => {
     );
 
     if (!roles.length) {
-      throw new Error(`System role "${userRole}" was not found in the database.`);
+      throw new Error(
+        `System role "${userRole}" was not found in the database.`,
+      );
     }
 
     // Assign role
@@ -161,6 +170,104 @@ export const registerUser = async (req, res) => {
       await client.query("ROLLBACK").catch(() => {});
     }
 
+    return res.status(StatusCodes.INTERNAL_SERVER_ERROR).json({
+      message: rMessage.internal_server_error,
+    });
+  } finally {
+    if (client) client.release();
+  }
+};
+
+export const loginUser = async (req, res) => {
+  let client;
+
+  try {
+    const body = req?.body ?? {};
+
+    const { identifier, password } = body;
+
+    if (!isValidString(identifier) || !isValidString(password)) {
+      return res.status(StatusCodes.BAD_REQUEST).json({
+        message: rMessage.invalid_login_input,
+      });
+    }
+
+    const cleanIdentifier = identifier.trim().toLowerCase();
+    const cleanPassword = password.trim();
+
+    const identifierType = resolveIdentifierType(cleanIdentifier);
+
+    if (!identifierType) {
+      return res.status(StatusCodes.BAD_REQUEST).json({
+        message: rMessage.invalid_login_input,
+      });
+    }
+
+    client = await getClient();
+
+    const column = identifierType === "email" ? "email" : "username";
+
+    const { rows } = await client.query(
+      `SELECT
+         id,
+         username,
+         email,
+         full_name,
+         profile_photo_url,
+         password_hash,
+         is_active,
+         is_verified
+       FROM users
+       WHERE ${column} = $1
+       LIMIT 1`,
+      [cleanIdentifier],
+    );
+
+    const user = rows[0] ?? null;
+
+    const passwordMatch = user
+      ? await bcrypt.compare(cleanPassword, user.password_hash)
+      : false;
+
+    if (!user || !passwordMatch) {
+      return res.status(StatusCodes.UNAUTHORIZED).json({
+        message: rMessage.invalid_credentials,
+      });
+    }
+
+    if (!user.is_active) {
+      return res.status(StatusCodes.FORBIDDEN).json({
+        message: rMessage.account_disabled,
+      });
+    }
+
+    if (!user.is_verified) {
+      return res.status(StatusCodes.FORBIDDEN).json({
+        message: rMessage.email_not_verified,
+      });
+    }
+    const accessToken = jwt.sign(
+        { userId: user?.id },
+        process.env.ACCESS_TOKEN_SECRET,
+        { expiresIn: ACCESS_TOKEN_EXPIRY },
+    );
+    res.Cookies("tid",accessToken)
+
+    return res.status(StatusCodes.OK).json({
+      success: true,
+      message: rMessage.login_success,
+      data: {
+        user: {
+          id: user.id,
+          username: user.username,
+          email: user.email,
+          full_name: user.full_name,
+          profile_photo_url: user.profile_photo_url,
+        },
+        token: accessToken,
+      },
+    });
+  } catch (_) {
     return res.status(StatusCodes.INTERNAL_SERVER_ERROR).json({
       message: rMessage.internal_server_error,
     });
