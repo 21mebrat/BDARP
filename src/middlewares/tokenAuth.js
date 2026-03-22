@@ -4,6 +4,7 @@ import { rMessage } from "../utils/responseMessages.js";
 import { getClient } from "../config/db";
 
 export const tokenAuth = async (req, res, next) => {
+  let client;
   try {
     const authHeader = req.headers.authorization || req.headers.Authorization;
 
@@ -35,7 +36,7 @@ export const tokenAuth = async (req, res, next) => {
       });
     }
 
-    const client = await getClient();
+    client = await getClient();
     const result = await client.query(
       `
   SELECT id, is_active, email_verified
@@ -81,5 +82,7 @@ export const tokenAuth = async (req, res, next) => {
     return res.status(StatusCodes.FORBIDDEN).json({
       message: rMessage.invalid_token,
     });
+  } finally {
+    if (client) client.release();
   }
 };
