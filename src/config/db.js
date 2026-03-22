@@ -26,11 +26,9 @@ export const connectDB = async () => {
   try {
     const client = await pool.connect();
 
-    const res = await client.query("SELECT NOW()");
+    // const res = await client.query("SELECT NOW()");
 
     console.log("PostgreSQL connected successfully");
-    console.log("Database time:", res.rows[0].now);
-
     client.release();
   } catch (error) {
     console.error("PostgreSQL connection failed:", error);
