@@ -86,4 +86,24 @@ export const rMessage = {
     "Full name must be between 2 and 100 characters and contain only letters and spaces.",
   profile_photo_invalid:
     "Profile photo must be a valid URL starting with http:// or https://.",
+  //Author
+  author_name_invalid: "Author name is invalid or exceeds 200 characters.",
+
+  author_bio_invalid: "Author biography exceeds the allowed length.",
+
+  author_birth_future: "Birth date cannot be a future date.",
+
+  author_death_before_birth: "Death date must be later than birth date.",
+
+  author_nationality_invalid: "Nationality must not exceed 100 characters.",
+
+  author_created_success: "Author profile has been successfully created.",
+
+  author_updated_success: "Author profile has been successfully updated.",
+
+  author_deleted_success: "Author has been successfully removed.",
+
+  author_not_found: "The requested author could not be found.",
+
+  author_already_exists: "An author with the same identifier already exists.",
 };

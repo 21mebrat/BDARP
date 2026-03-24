@@ -1,0 +1,662 @@
+-- ═══════════════════════════════════════════════════════════════════
+-- 00 · EXTENSIONS · ENUMs · SHARED TRIGGER FACTORY
+-- Run once on a fresh database before any CREATE TABLE.
+-- ═══════════════════════════════════════════════════════════════════
+CREATE EXTENSION IF NOT EXISTS "uuid-ossp";      -- gen_random_uuid()
+CREATE EXTENSION IF NOT EXISTS "pg_trgm";       -- GIN trigram indexes for ILIKE
+CREATE EXTENSION IF NOT EXISTS "btree_gist";    -- exclusion constraints
+CREATE EXTENSION IF NOT EXISTS "citext";        -- case-insensitive text (email)
+-- ── ENUMs ─────────────────────────────────────────────────────────
+CREATE TYPE interaction_type AS ENUM (
+    'view', 'download', 'like', 'dislike'
+);
+CREATE TYPE reading_list_type AS ENUM (
+    'want_to_read', 'currently_reading', 'read'
+);
+CREATE TYPE notification_type AS ENUM (
+    'new_follower', 'book_finished', 'new_book_uploaded',
+    'recommendation', 'new_message', 'shelf_shared', 'system'
+);
+CREATE TYPE message_type AS ENUM (
+    'text', 'image', 'book_share', 'file'
+);
+CREATE TYPE file_format AS ENUM (
+    'pdf', 'epub', 'mobi', 'txt', 'djvu'
+);
+CREATE TYPE author_role AS ENUM (
+    'author', 'co_author', 'editor', 'translator', 'illustrator'
+);
+CREATE TYPE recommendation_reason AS ENUM (
+    'reading_history', 'popular_in_category',
+    'similar_users', 'trending', 'top_rated'
+);
+CREATE TYPE period_type AS ENUM (
+    'weekly', 'monthly', 'yearly'
+);
+-- ── Shared updated_at trigger factory ─────────────────────────────
+-- Usage: SELECT trigger_updated_at('table_name');
+-- Attaches a BEFORE UPDATE trigger to auto-set updated_at = now().
+-- Define once, reuse everywhere — no copy-paste drift.
+CREATE OR REPLACE FUNCTION set_updated_at()
+RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+    NEW.updated_at := clock_timestamp();  -- clock_timestamp() = wall clock inside txn
+    RETURN NEW;
+END;
+$$;
+CREATE OR REPLACE FUNCTION trigger_updated_at(p_table TEXT)
+RETURNS VOID LANGUAGE plpgsql AS $$
+BEGIN
+    EXECUTE format(
+        'CREATE OR REPLACE TRIGGER set_updated_at
+         BEFORE UPDATE ON %I
+         FOR EACH ROW EXECUTE FUNCTION set_updated_at()'
+,
+        p_table
+    );
+END;
+$$;
+
+-- ═══════════════════════════════════════════════════════════════════
+-- 01 · users
+-- Central identity table. All other user-related tables FK here.
+-- ═══════════════════════════════════════════════════════════════════
+CREATE TABLE users (
+    -- ── Primary Key ───────────────────────────────────────────────
+    id                   UUID           PRIMARY KEY
+                                        DEFAULT gen_random_uuid(),
+    -- ── Identity ──────────────────────────────────────────────────
+    username             VARCHAR(50)    NOT NULL,
+    email                CITEXT         NOT NULL,  -- case-insensitive, normalized
+    password_hash        VARCHAR(255)   NOT NULL,  -- bcrypt / argon2id hash ONLY
+    -- ── Profile ───────────────────────────────────────────────────
+    full_name            VARCHAR(150),
+    bio                  TEXT,
+    profile_photo_url    VARCHAR(500),
+    website_url          VARCHAR(500),
+    -- ── Denormalised social counters (maintained by triggers) ─────
+    follower_count       INT            NOT NULL  DEFAULT 0
+                                        CHECK (follower_count  >= 0),
+    following_count      INT            NOT NULL  DEFAULT 0
+                                        CHECK (following_count >= 0),
+    -- ── Status & Lifecycle ────────────────────────────────────────
+    is_active            BOOLEAN        NOT NULL  DEFAULT TRUE,
+    is_verified          BOOLEAN        NOT NULL  DEFAULT FALSE,
+    email_verified_at    TIMESTAMPTZ,              -- NULL until link clicked
+    last_login_at        TIMESTAMPTZ,
+    deleted_at           TIMESTAMPTZ,              -- NULL = active  (soft-delete)
+    -- ── Timestamps ────────────────────────────────────────────────
+    created_at           TIMESTAMPTZ    NOT NULL  DEFAULT now(),
+    updated_at           TIMESTAMPTZ    NOT NULL  DEFAULT now(),
+    -- ── Constraints ───────────────────────────────────────────────
+    CONSTRAINT uq_users_username      UNIQUE (username),
+    CONSTRAINT uq_users_email         UNIQUE (email),
+    CONSTRAINT chk_username_format
+        CHECK (username ~ '^[a-z0-9_-.]{3,50}$'),  -- lowercase, URL-safe
+    CONSTRAINT chk_deleted_not_active
+        CHECK (deleted_at IS NULL OR is_active = FALSE)
+);
+-- Auto-update updated_at on any UPDATE
+SELECT trigger_updated_at('users');
+-- Indexes
+CREATE INDEX idx_users_email
+    ON users (email);
+CREATE INDEX idx_users_active_only
+    ON users (id)
+    WHERE is_active = TRUE AND deleted_at IS NULL;  -- partial: lean footprint
+CREATE INDEX idx_users_username_trgm
+    ON users USING GIN (username gin_trgm_ops);     -- autocomplete search
+CREATE INDEX idx_users_created_at
+    ON users (created_at DESC);  
+
+
+-- ═══════════════════════════════════════════════════════════════════
+-- 02 · authors
+-- ═══════════════════════════════════════════════════════════════════
+CREATE TABLE authors (
+    id              UUID         PRIMARY KEY  DEFAULT gen_random_uuid(),
+    name            VARCHAR(200) NOT NULL,
+    slug            VARCHAR(220) NOT NULL,      -- URL-safe: "george-orwell"
+    bio             TEXT,
+    photo_url       VARCHAR(500),
+    birth_date      DATE,
+    death_date      DATE,                    -- NULL if still alive
+    nationality     VARCHAR(100),
+    website_url     VARCHAR(500),
+    -- Full-text search — auto-maintained GENERATED column
+    search_vector   TSVECTOR
+        GENERATED ALWAYS AS (
+            setweight(to_tsvector('english', coalesce(name,'')), 'A') ||
+            setweight(to_tsvector('english', coalesce(bio,'')),  'C')
+        ) STORED,
+    -- Audit trail
+    created_by      UUID
+        REFERENCES users(id) ON DELETE SET NULL,
+    created_at      TIMESTAMPTZ  NOT NULL  DEFAULT now(),
+    updated_at      TIMESTAMPTZ  NOT NULL  DEFAULT now(),
+    CONSTRAINT uq_authors_slug   UNIQUE (slug),
+    CONSTRAINT chk_author_dates
+        CHECK (death_date IS NULL OR death_date > birth_date)
+);
+SELECT trigger_updated_at('authors');
+CREATE INDEX idx_authors_name_trgm
+    ON authors USING GIN (name gin_trgm_ops);   -- ILIKE '%orw%' search
+CREATE INDEX idx_authors_fts
+    ON authors USING GIN (search_vector); 
+
+
+-- ═══════════════════════════════════════════════════════════════════
+-- 03 · categories
+-- Self-referencing: parent_id NULL = root category
+-- Traverse with WITH RECURSIVE cte AS (...)
+-- ═══════════════════════════════════════════════════════════════════
+CREATE TABLE categories (
+    id           UUID          PRIMARY KEY  DEFAULT gen_random_uuid(),
+    name         VARCHAR(100)  NOT NULL,
+    slug         VARCHAR(120)  NOT NULL,
+    description  TEXT,
+    icon_url     VARCHAR(500),
+    color_hex    CHAR(7),                     -- '#4fffb0' — for UI badge rendering
+    sort_order   SMALLINT      NOT NULL  DEFAULT 0,
+    -- Self-referencing FK for unlimited hierarchy depth
+    parent_id    UUID
+        REFERENCES categories(id) ON DELETE SET NULL,
+    created_at   TIMESTAMPTZ   NOT NULL  DEFAULT now(),
+    updated_at   TIMESTAMPTZ   NOT NULL  DEFAULT now(),
+    CONSTRAINT uq_categories_slug  UNIQUE (slug),
+    CONSTRAINT uq_categories_name  UNIQUE (name),
+    CONSTRAINT chk_color_format
+        CHECK (color_hex IS NULL OR color_hex ~ '^#[0-9A-Fa-f]{6}$'),
+    CONSTRAINT chk_no_self_parent
+        CHECK (parent_id <> id)                  -- prevent direct self-reference
+);
+SELECT trigger_updated_at('categories');
+CREATE INDEX idx_categories_parent
+    ON categories (parent_id);                  -- child lookup
+CREATE INDEX idx_categories_sort
+    ON categories (sort_order, name);
+-- Example: recursive query to fetch full category tree
+-- WITH RECURSIVE tree AS (
+--     SELECT id, name, parent_id, 0 AS depth
+--     FROM categories WHERE parent_id IS NULL
+--   UNION ALL
+--     SELECT c.id, c.name, c.parent_id, t.depth + 1
+--     FROM categories c JOIN tree t ON c.parent_id = t.id
+-- )
+-- SELECT * FROM tree ORDER BY depth, sort_order;
+
+
+
+
+-- ═══════════════════════════════════════════════════════════════════
+-- 04 · tags
+-- Flat keyword tags. Complements categories (categories = curated
+-- tree; tags = fine-grained intent keywords like "slow-burn").
+-- ═══════════════════════════════════════════════════════════════════
+CREATE TABLE tags (
+    id           UUID         PRIMARY KEY  DEFAULT gen_random_uuid(),
+    name         VARCHAR(60)  NOT NULL,
+    slug         VARCHAR(60)  NOT NULL,
+    -- Denormalised: maintained by trigger on book_tags INSERT/DELETE
+    usage_count  INT          NOT NULL  DEFAULT 0
+                              CHECK (usage_count >= 0),
+    created_at   TIMESTAMPTZ  NOT NULL  DEFAULT now(),
+    CONSTRAINT uq_tags_slug       UNIQUE (slug),
+    CONSTRAINT uq_tags_name       UNIQUE (name),
+    CONSTRAINT chk_tag_lowercase
+        CHECK (name = lower(name))       -- no "Fantasy" + "fantasy" duplicates
+);
+CREATE INDEX idx_tags_usage
+    ON tags (usage_count DESC);              -- popular-tags widget
+CREATE INDEX idx_tags_name_trgm
+    ON tags USING GIN (name gin_trgm_ops);  -- tag autocomplete
+
+
+-- ═══════════════════════════════════════════════════════════════════
+-- 05 · books
+-- Central table. book_score is a GENERATED column — recomputes
+-- automatically whenever any counter column changes.
+-- ═══════════════════════════════════════════════════════════════════
+CREATE TABLE books (
+    id                  UUID          PRIMARY KEY
+                                      DEFAULT gen_random_uuid(),
+    -- ── Bibliographic ─────────────────────────────────────────────
+    title               VARCHAR(500)   NOT NULL,
+    subtitle            VARCHAR(500),
+    slug                VARCHAR(560)   NOT NULL,
+    description         TEXT,
+    isbn_13             VARCHAR(17),                  -- e.g. "978-3-16-148410-0"
+    language            CHAR(5)        NOT NULL  DEFAULT 'en',
+    page_count          INT
+                        CHECK (page_count > 0),
+    published_date      DATE,
+    publisher           VARCHAR(200),
+    edition             VARCHAR(50),
+    -- ── File & Delivery ───────────────────────────────────────────
+    cover_image_url     VARCHAR(500),
+    file_url            VARCHAR(500),              -- S3/GCS internal path
+    file_format         file_format,
+    file_size_bytes     BIGINT
+                        CHECK (file_size_bytes > 0),
+    telegram_file_id    VARCHAR(200),             -- Telegram Bot API file_id
+    -- ── Interaction Counters (updated by trigger on interactions) ─
+    download_count      INT  NOT NULL  DEFAULT 0
+                        CHECK (download_count >= 0),
+    view_count          INT  NOT NULL  DEFAULT 0
+                        CHECK (view_count      >= 0),
+    like_count          INT  NOT NULL  DEFAULT 0
+                        CHECK (like_count      >= 0),
+    dislike_count       INT  NOT NULL  DEFAULT 0
+                        CHECK (dislike_count   >= 0),
+    -- ── GENERATED score (no application code needed) ──────────────
+    --   Formula: (download×5) + (view×1) + (like×3) − (dislike×3)
+    --   Stored physically — ORDER BY book_score is an index scan.
+    book_score          BIGINT
+        GENERATED ALWAYS AS
+        ((download_count * 5)
+         + (view_count     * 1)
+         + (like_count    * 3)
+         - (dislike_count * 3))
+        STORED,
+    -- ── GENERATED full-text vector ────────────────────────────────
+    --   title weight A (highest), subtitle B, description C
+    search_vector       TSVECTOR
+        GENERATED ALWAYS AS (
+            setweight(to_tsvector('english',
+                coalesce(title,'')), 'A')   ||
+            setweight(to_tsvector('english',
+                coalesce(subtitle,'')), 'B') ||
+            setweight(to_tsvector('english',
+                coalesce(description,'')), 'C')
+        ) STORED,
+    -- ── Visibility & Audit ────────────────────────────────────────
+    is_published        BOOLEAN       NOT NULL  DEFAULT FALSE,
+    published_at        TIMESTAMPTZ,
+    uploaded_by         UUID          NOT NULL
+        REFERENCES users(id) ON DELETE RESTRICT,
+    created_at          TIMESTAMPTZ   NOT NULL  DEFAULT now(),
+    updated_at          TIMESTAMPTZ   NOT NULL  DEFAULT now(),
+    CONSTRAINT uq_books_slug    UNIQUE (slug),
+    CONSTRAINT uq_books_isbn13  UNIQUE (isbn_13)
+);
+SELECT trigger_updated_at('books');
+-- Trending & Popular pages — most critical read query
+CREATE INDEX idx_books_score
+    ON books (book_score DESC)
+    WHERE is_published = TRUE;
+-- Full-text search — search bar
+CREATE INDEX idx_books_fts
+    ON books USING GIN (search_vector);
+-- Autocomplete title prefix search
+CREATE INDEX idx_books_title_trgm
+    ON books USING GIN (title gin_trgm_ops)
+    WHERE is_published = TRUE;
+-- New arrivals feed
+CREATE INDEX idx_books_published_at
+    ON books (published_at DESC)
+    WHERE is_published = TRUE;
+-- ── Trigger: increment counter on each interaction INSERT ────────
+CREATE OR REPLACE FUNCTION fn_update_book_counters()
+RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+    CASE NEW.type
+        WHEN 'download' THEN
+            UPDATE books SET download_count = download_count + 1
+            WHERE id = NEW.book_id;
+        WHEN 'view' THEN
+            UPDATE books SET view_count     = view_count     + 1
+            WHERE id = NEW.book_id;
+        WHEN 'like' THEN
+            UPDATE books SET like_count     = like_count     + 1
+            WHERE id = NEW.book_id;
+        WHEN 'dislike' THEN
+            UPDATE books SET dislike_count  = dislike_count  + 1
+            WHERE id = NEW.book_id;
+    END CASE;
+    -- book_score recomputes automatically (GENERATED column)
+    RETURN NEW;
+END;
+$$;
+
+
+
+-- ═══════════════════════════════════════════════════════════════════
+-- 06 · book_authors  (many-to-many junction)
+-- Composite PK prevents same author twice on same book.
+-- ═══════════════════════════════════════════════════════════════════
+CREATE TABLE book_authors (
+    book_id     UUID         NOT NULL
+        REFERENCES books(id)   ON DELETE CASCADE,
+    author_id   UUID         NOT NULL
+        REFERENCES authors(id) ON DELETE CASCADE,
+    role        author_role  NOT NULL  DEFAULT 'author',
+    sort_order  SMALLINT     NOT NULL  DEFAULT 0,
+    CONSTRAINT pk_book_authors
+        PRIMARY KEY (book_id, author_id)
+);
+-- "Books by Author X" — every author page, every recommendation join
+CREATE INDEX idx_book_authors_author
+    ON book_authors (author_id);
+
+
+-- ═══════════════════════════════════════════════════════════════════
+-- 07 · book_categories  (many-to-many junction)
+-- ═══════════════════════════════════════════════════════════════════
+CREATE TABLE book_categories (
+    book_id      UUID     NOT NULL
+        REFERENCES books(id)       ON DELETE CASCADE,
+    category_id  UUID     NOT NULL
+        REFERENCES categories(id)  ON DELETE CASCADE,
+    is_primary   BOOLEAN  NOT NULL  DEFAULT FALSE,
+    created_at   TIMESTAMPTZ  NOT NULL  DEFAULT now(),
+    CONSTRAINT pk_book_categories
+        PRIMARY KEY (book_id, category_id)
+);
+-- "Browse Category" page — most common listing pattern
+CREATE INDEX idx_book_cats_category
+    ON book_categories (category_id);
+
+
+
+-- ═══════════════════════════════════════════════════════════════════
+-- 08 · book_tags  (many-to-many junction)
+-- ═══════════════════════════════════════════════════════════════════
+CREATE TABLE book_tags (
+    book_id    UUID  NOT NULL
+        REFERENCES books(id)  ON DELETE CASCADE,
+    tag_id     UUID  NOT NULL
+        REFERENCES tags(id)   ON DELETE CASCADE,
+    created_at TIMESTAMPTZ  NOT NULL  DEFAULT now(),
+    CONSTRAINT pk_book_tags  PRIMARY KEY (book_id, tag_id)
+);
+CREATE INDEX idx_book_tags_tag
+    ON book_tags (tag_id);                       -- "all books tagged 'dystopia'"
+-- Trigger: keep tags.usage_count in sync atomically
+CREATE OR REPLACE FUNCTION fn_sync_tag_usage()
+RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+    IF (TG_OP = 'INSERT') THEN
+        UPDATE tags SET usage_count = usage_count + 1
+
+        WHERE id = NEW.tag_id;
+    ELSIF (TG_OP = 'DELETE') THEN
+        UPDATE tags
+        SET usage_count = greatest(usage_count - 1, 0)
+        WHERE id = OLD.tag_id;
+    END IF;
+    RETURN NULL;
+END;
+$$;
+CREATE TRIGGER trg_tag_usage
+    AFTER INSERT OR DELETE ON book_tags
+    FOR EACH ROW EXECUTE FUNCTION fn_sync_tag_usage();
+
+
+
+-- ═══════════════════════════════════════════════════════════════════
+-- 09 · roles
+-- ═══════════════════════════════════════════════════════════════════
+CREATE TABLE roles (
+    id           UUID         PRIMARY KEY  DEFAULT gen_random_uuid(),
+    name         VARCHAR(50)  NOT NULL,
+    description  TEXT,
+    is_system    BOOLEAN      NOT NULL  DEFAULT FALSE,
+    created_at   TIMESTAMPTZ  NOT NULL  DEFAULT now(),
+    CONSTRAINT uq_roles_name  UNIQUE (name)
+);
+-- Seed system roles — run in same migration
+INSERT INTO roles (name, description, is_system) VALUES
+    ('admin',     'Full platform access — book upload, user management',  TRUE),
+    ('moderator', 'Content moderation and book editing',               TRUE),
+    ('user',      'Standard authenticated user',                        TRUE);
+
+
+-- ═══════════════════════════════════════════════════════════════════
+-- 10 · permissions
+-- resource + action pattern — self-documenting, queryable.
+-- ═══════════════════════════════════════════════════════════════════
+CREATE TABLE permissions (
+    id           UUID          PRIMARY KEY  DEFAULT gen_random_uuid(),
+    name         VARCHAR(100)  NOT NULL,    -- 'book:upload'
+    resource     VARCHAR(50)   NOT NULL,    -- 'book' | 'user' | 'category'
+    action       VARCHAR(50)   NOT NULL,    -- 'create' | 'update' | 'ban'
+    description  TEXT,
+    created_at   TIMESTAMPTZ   NOT NULL  DEFAULT now(),
+    CONSTRAINT uq_perm_name            UNIQUE (name),
+    CONSTRAINT uq_perm_resource_action  UNIQUE (resource, action)
+);
+-- Seed core permissions
+INSERT INTO permissions (name, resource, action) VALUES
+    ('book:create',    'book',     'create'),
+    ('book:update',    'book',     'update'),
+    ('book:delete',    'book',     'delete'),
+    ('book:upload',    'book',     'upload'),
+    ('book:publish',   'book',     'publish'),
+    ('user:ban',       'user',     'ban'),
+    ('user:delete',    'user',     'delete'),
+    ('author:create',  'author',   'create'),
+    ('author:update',  'author',   'update'),
+    ('category:manage','category', 'manage');
+
+
+
+-- ═══════════════════════════════════════════════════════════════════
+-- 11 · user_roles
+-- ═══════════════════════════════════════════════════════════════════
+CREATE TABLE user_roles (
+    user_id      UUID         NOT NULL
+        REFERENCES users(id)  ON DELETE CASCADE,
+    role_id      UUID         NOT NULL
+        REFERENCES roles(id)  ON DELETE CASCADE,
+    assigned_by  UUID
+        REFERENCES users(id)  ON DELETE SET NULL,  -- audit trail
+    assigned_at  TIMESTAMPTZ  NOT NULL  DEFAULT now(),
+    expires_at   TIMESTAMPTZ,                         -- NULL = permanent
+    CONSTRAINT pk_user_roles  PRIMARY KEY (user_id, role_id)
+);
+CREATE INDEX idx_user_roles_role
+    ON user_roles (role_id);                        -- "all admins" query
+-- Partial index: filter active (non-expired) role assignments
+-- App uses: WHERE (expires_at IS NULL OR expires_at > now())
+CREATE INDEX idx_user_roles_active
+    ON user_roles (user_id, role_id)
+    WHERE expires_at IS NULL;
+
+
+
+-- ═══════════════════════════════════════════════════════════════════
+-- 12 · role_permissions
+-- ═══════════════════════════════════════════════════════════════════
+CREATE TABLE role_permissions (
+    role_id        UUID  NOT NULL
+        REFERENCES roles(id)        ON DELETE CASCADE,
+    permission_id  UUID  NOT NULL
+        REFERENCES permissions(id)  ON DELETE CASCADE,
+    granted_at     TIMESTAMPTZ  NOT NULL  DEFAULT now(),
+    CONSTRAINT pk_role_permissions
+        PRIMARY KEY (role_id, permission_id)
+);
+CREATE INDEX idx_role_perms_perm
+    ON role_permissions (permission_id);
+-- Seed: assign all permissions to admin role
+-- (replace role UUIDs with your seeded values via subquery)
+INSERT INTO role_permissions (role_id, permission_id)
+SELECT r.id, p.id
+FROM   roles r CROSS JOIN permissions p
+WHERE  r.name = 'admin';
+
+
+
+-- 13 · interactions  (implicit rating event log)
+-- Append-only. Trigger on INSERT updates books counters.
+-- book_score recomputes automatically (GENERATED column on books).
+-- ═══════════════════════════════════════════════════════════════════
+CREATE TABLE interactions (
+    id          UUID              PRIMARY KEY
+                                  DEFAULT gen_random_uuid(),
+    user_id     UUID
+        REFERENCES users(id)  ON DELETE SET NULL,     -- NULL = anonymous user
+    book_id     UUID              NOT NULL
+        REFERENCES books(id)  ON DELETE CASCADE,
+    type        interaction_type  NOT NULL,
+    session_id  VARCHAR(100),                          -- anonymous browser session
+    ip_address  INET,                                 -- native IPv4 + IPv6 type
+    user_agent  TEXT,
+    metadata    JSONB,                                -- {"page": 42, "duration_s": 120}
+    created_at  TIMESTAMPTZ       NOT NULL  DEFAULT now(),
+    -- One like OR dislike per (user, book) — DEFERRABLE for swap transactions
+    CONSTRAINT uq_user_book_vote
+        UNIQUE (user_id, book_id, type)
+        DEFERRABLE INITIALLY DEFERRED
+);
+-- Counter-update trigger target: (book_id, type)
+CREATE INDEX idx_inter_book_type
+    ON interactions (book_id, type);
+-- User reading history (most recent first)
+CREATE INDEX idx_inter_user_hist
+    ON interactions (user_id, created_at DESC)
+    WHERE user_id IS NOT NULL;
+-- BRIN: ideal for append-only time-series — tiny size, fast range scans
+CREATE INDEX idx_inter_brin
+    ON interactions USING BRIN (created_at);
+-- Attach the counter-update trigger (function defined in table 05)
+CREATE TRIGGER trg_update_book_counters
+    AFTER INSERT ON interactions
+    FOR EACH ROW EXECUTE FUNCTION fn_update_book_counters();
+
+
+-- ═══════════════════════════════════════════════════════════════════
+-- 14 · reading_lists
+-- ═══════════════════════════════════════════════════════════════════
+CREATE TABLE reading_lists (
+    id          UUID               PRIMARY KEY  DEFAULT gen_random_uuid(),
+    user_id     UUID               NOT NULL
+        REFERENCES users(id)      ON DELETE CASCADE,
+    list_type   reading_list_type  NOT NULL,
+    name        VARCHAR(100)       NOT NULL,
+    is_public   BOOLEAN            NOT NULL  DEFAULT TRUE,
+    created_at  TIMESTAMPTZ        NOT NULL  DEFAULT now(),
+    -- One list per type per user — enforced at DB level
+    CONSTRAINT uq_user_list_type  UNIQUE (user_id, list_type)
+);
+CREATE INDEX idx_rl_user
+    ON reading_lists (user_id);
+-- Auto-create 3 default lists whenever a new user registers
+CREATE OR REPLACE FUNCTION fn_create_default_reading_lists()
+RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+    INSERT INTO reading_lists
+        (user_id,  list_type,            name)
+    VALUES
+        (NEW.id,  'want_to_read',      'Want to Read'),
+        (NEW.id,  'currently_reading', 'Currently Reading'),
+        (NEW.id,  'read',              'Read');
+    RETURN NEW;
+END;
+$$;
+CREATE TRIGGER trg_default_reading_lists
+    AFTER INSERT ON users
+    FOR EACH ROW EXECUTE FUNCTION fn_create_default_reading_lists();
+
+
+
+
+-- ═══════════════════════════════════════════════════════════════════
+-- 15 · reading_list_books
+-- ═══════════════════════════════════════════════════════════════════
+CREATE TABLE reading_list_books (
+    reading_list_id   UUID      NOT NULL
+        REFERENCES reading_lists(id)  ON DELETE CASCADE,
+    book_id           UUID      NOT NULL
+        REFERENCES books(id)          ON DELETE CASCADE,
+    added_at          TIMESTAMPTZ  NOT NULL  DEFAULT now(),
+    started_at        TIMESTAMPTZ,
+    finished_at       TIMESTAMPTZ,
+    progress_percent  SMALLINT     NOT NULL  DEFAULT 0,
+    user_notes        TEXT,                     -- private, never shown to followers
+    sort_order        INT          NOT NULL  DEFAULT 0,
+    CONSTRAINT pk_rl_books
+        PRIMARY KEY (reading_list_id, book_id),
+    CONSTRAINT chk_progress_range
+        CHECK (progress_percent BETWEEN 0 AND 100),
+    CONSTRAINT chk_dates_order
+        CHECK (
+            finished_at IS NULL
+            OR started_at IS NULL
+            OR finished_at >= started_at
+        )
+);
+CREATE INDEX idx_rl_books_book
+    ON reading_list_books (book_id);
+
+
+
+-- ═══════════════════════════════════════════════════════════════════
+-- 16 · custom_shelves
+-- ═══════════════════════════════════════════════════════════════════
+CREATE TABLE custom_shelves (
+    id               UUID         PRIMARY KEY  DEFAULT gen_random_uuid(),
+    user_id          UUID         NOT NULL
+        REFERENCES users(id)   ON DELETE CASCADE,
+    name             VARCHAR(100) NOT NULL,
+    description      TEXT,
+    cover_image_url  VARCHAR(500),
+    is_public        BOOLEAN      NOT NULL  DEFAULT TRUE,
+    book_count       INT          NOT NULL  DEFAULT 0
+                     CHECK (book_count >= 0),
+    created_at       TIMESTAMPTZ  NOT NULL  DEFAULT now(),
+    updated_at       TIMESTAMPTZ  NOT NULL  DEFAULT now()
+);
+
+-- Create the case-insensitive unique constraint using an index
+CREATE UNIQUE INDEX uq_shelf_user_name 
+    ON custom_shelves (user_id, lower(name));
+
+-- Create the updated_at trigger function (assuming it exists)
+SELECT trigger_updated_at('custom_shelves');
+
+-- Create indexes
+CREATE INDEX idx_shelves_user
+    ON custom_shelves (user_id);
+
+CREATE INDEX idx_shelves_public
+    ON custom_shelves (user_id)
+    WHERE is_public = TRUE;
+
+
+-- ═══════════════════════════════════════════════════════════════════
+-- 17 · custom_shelf_books
+-- ═══════════════════════════════════════════════════════════════════
+CREATE TABLE custom_shelf_books (
+    shelf_id    UUID         NOT NULL
+        REFERENCES custom_shelves(id)  ON DELETE CASCADE,
+    book_id     UUID         NOT NULL
+        REFERENCES books(id)          ON DELETE CASCADE,
+    added_at    TIMESTAMPTZ  NOT NULL  DEFAULT now(),
+    sort_order  INT          NOT NULL  DEFAULT 0,
+    CONSTRAINT pk_shelf_books
+        PRIMARY KEY (shelf_id, book_id)
+);
+CREATE INDEX idx_shelf_books_book
+    ON custom_shelf_books (book_id);
+-- Trigger: maintain custom_shelves.book_count
+CREATE OR REPLACE FUNCTION fn_sync_shelf_count()
+RETURNS TRIGGER LANGUAGE plpgsql AS $$
+BEGIN
+    IF (TG_OP = 'INSERT') THEN
+        UPDATE custom_shelves
+        SET book_count = book_count + 1
+        WHERE id = NEW.shelf_id;
+    ELSIF (TG_OP = 'DELETE') THEN
+        UPDATE custom_shelves
+        SET book_count = greatest(book_count - 1, 0)
+        WHERE id = OLD.shelf_id;
+    END IF;
+    RETURN NULL;
+END;
+$$;
+CREATE TRIGGER trg_shelf_count
+    AFTER INSERT OR DELETE ON custom_shelf_books
+    FOR EACH ROW EXECUTE FUNCTION fn_sync_shelf_count();
+
+
