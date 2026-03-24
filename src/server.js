@@ -4,11 +4,8 @@ import http from "http";
 import express from "express";
 import cors from "cors";
 import helmet from "helmet";
-import { Server as SocketIOServer } from "socket.io";
 // import { initSocket } from "./socket.js";
 import { connectDB } from "./config/db.js";
-
-// ─── Environment ───────────────────────────────────────────────────────────
 
 process.env.TZ = "Africa/Addis_Ababa";
 
@@ -150,6 +147,7 @@ app.use(
 
 // Mount route modules here, e.g.:
 // app.use(`${API}/books_api`, bookRoutes);
+app.use("abugida_api/users", require("./routes/user/userRoutes.js"));
 
 // ─── 404 catch-all ─────────────────────────────────────────────────────────
 
