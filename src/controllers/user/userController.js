@@ -2,6 +2,8 @@ import { StatusCodes } from "http-status-codes";
 import bcrypt from "bcryptjs";
 import { getClient } from "../db/db.js";
 import { rMessage } from "../utils/responseMessages.js";
+import { buildVerificationEmail } from "../../utils/emailTemplates.js";
+import { sendVerificationEmail } from "../../utils/sendVerificationEmail.js";
 
 const SALT_ROUNDS = 12;
 
@@ -129,6 +131,18 @@ export const registerUser = async (req, res) => {
 
     const password_hash = await bcrypt.hash(password, SALT_ROUNDS);
 
+    //send email verification
+    const verificationResult = await sendVerificationEmail(
+      userId,
+      email,
+      username,
+    );
+    if (!verificationResult) {
+      await client.query("ROLLBACK");
+      return res.status(StatusCodes.BAD_REQUEST).json({
+        message: rMessage.email_not_verified,
+      });
+    }
     // Insert user — let the DB auto-generate the primary key
     const { rows: created } = await client.query(
       `INSERT INTO users
@@ -163,7 +177,7 @@ export const registerUser = async (req, res) => {
     await client.query("COMMIT");
 
     return res.status(StatusCodes.CREATED).json({
-      message: rMessage.user_registered,
+      message: rMessage.verification_email_sent,
     });
   } catch (error) {
     if (client) {
@@ -247,11 +261,11 @@ export const loginUser = async (req, res) => {
       });
     }
     const accessToken = jwt.sign(
-        { userId: user?.id },
-        process.env.ACCESS_TOKEN_SECRET,
-        { expiresIn: ACCESS_TOKEN_EXPIRY },
+      { userId: user?.id },
+      process.env.ACCESS_TOKEN_SECRET,
+      { expiresIn: ACCESS_TOKEN_EXPIRY },
     );
-    res.Cookies("tid",accessToken)
+    res.Cookies("tid", accessToken);
 
     return res.status(StatusCodes.OK).json({
       success: true,
@@ -275,3 +289,67 @@ export const loginUser = async (req, res) => {
     if (client) client.release();
   }
 };
+
+export const verifyEmail = async (req, res) => {
+  let client;
+
+  try {
+    const token = req?.query?.token;
+
+    if (!token || typeof token !== "string" || token.trim().length === 0) {
+      return res.status(StatusCodes.BAD_REQUEST).json({
+        message: rMessage.invalid_verification_token,
+      });
+    }
+
+    const cleanToken = token.trim();
+    const decoded = jwt.verify(cleanToken, process.env.ACCESS_TOKEN_SECRET);
+
+    if (!decoded || !decoded.userId || !decoded?.email) {
+      return res.status(StatusCodes.FORBIDDEN).json({
+        message: rMessage.invalid_verification_token,
+      });
+    }
+
+    client = await getClient();
+
+    const result = await client.query(
+      `
+  SELECT id, is_active, email
+  FROM users
+  WHERE id = $1 AND email = $2
+  LIMIT 1
+  `,
+      [decoded.userId, decoded?.email],
+    );
+
+    if (result.rowCount === 0) {
+      return res.status(StatusCodes.FORBIDDEN).json({
+        message: rMessage.invalid_verification_token,
+      });
+    }
+
+    await client.query("BEGIN");
+
+    await client.query(
+      `UPDATE users
+       SET is_verified = TRUE,
+           updated_at  = NOW()
+       WHERE id = $1 && email = $2`,
+      [decoded.userId, decoded?.email],
+    );
+    await client.query("COMMIT");
+
+    return res.status(StatusCodes.OK).json({
+      message: rMessage.email_verified_success,
+    });
+  } catch (error) {
+    if (client) await client.query("ROLLBACK").catch(() => {});
+    return res.status(StatusCodes.INTERNAL_SERVER_ERROR).json({
+      message: rMessage.internal_server_error,
+    });
+  } finally {
+    if (client) client.release();
+  }
+};
+

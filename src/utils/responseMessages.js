@@ -22,7 +22,7 @@ export const rMessage = {
   invalid_password:
     "Password must be at least 8 characters long and include at least one uppercase letter, one lowercase letter, one number, and one special character.",
   invalid_url:
-    "The website URL is not valid. Please provide a full URL starting with http:// or https://.",
+    "The website URL is not valid. Please provide a full URL starting with https://.",
   unknown_fields:
     "Your request contains unrecognized fields. Please review your input and try again.",
   role_not_found:
@@ -51,4 +51,19 @@ export const rMessage = {
     "Your email address has not been verified yet. Please check your inbox and verify before logging in.",
   invalid_login_input:
     "Please provide a valid username or email address along with your password.",
+  // ── Email Verification ────────────────────────────────────────────────────────
+  verification_email_sent:
+    "A verification link has been sent to your email address. Please check your inbox.",
+  email_already_verified:
+    "Your email address is already verified. You can log in now.",
+  invalid_verification_token:
+    "The verification link is invalid. Please request a new one.",
+  verification_token_expired:
+    "Your verification link has expired. Please request a fresh one.",
+  email_verified_success:
+    "Your email has been verified successfully. You can now log in to your account.",
+  verification_email_resent:
+    "A new verification link has been sent to your email address.",
+  user_not_found:
+    "No account was found with the provided details. Please register first.",
 };
