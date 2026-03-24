@@ -66,4 +66,24 @@ export const rMessage = {
     "A new verification link has been sent to your email address.",
   user_not_found:
     "No account was found with the provided details. Please register first.",
+  // ── Password Change ───────────────────────────────────────────────────────────
+  password_changed_success:
+    "Your password has been updated successfully. Please log in again with your new password.",
+  incorrect_current_password:
+    "The current password you entered is incorrect. Please try again.",
+  new_password_same_as_old:
+    "Your new password cannot be the same as your current password. Please choose a different one.",
+  invalid_new_password:
+    "New password must be at least 8 characters and include one uppercase letter, one lowercase letter, one number, and one special character.",
+  // ── Profile Update ────────────────────────────────────────────────────────────
+  profile_updated: "Your profile has been updated successfully.",
+  no_update_fields:
+    "No valid fields were provided to update. Please include at least one field.",
+  unknown_update_fields:
+    "Your request contains unrecognized fields. Only profile fields can be updated here.",
+  bio_too_long: "Bio must not exceed 300 characters.",
+  full_name_invalid:
+    "Full name must be between 2 and 100 characters and contain only letters and spaces.",
+  profile_photo_invalid:
+    "Profile photo must be a valid URL starting with http:// or https://.",
 };

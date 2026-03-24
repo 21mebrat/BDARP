@@ -4,6 +4,7 @@ import { getClient } from "../db/db.js";
 import { rMessage } from "../utils/responseMessages.js";
 import { buildVerificationEmail } from "../../utils/emailTemplates.js";
 import { sendVerificationEmail } from "../../utils/sendVerificationEmail.js";
+import { validateAndSaveFile } from "../../utils/saveFiles.js";
 
 const SALT_ROUNDS = 12;
 
@@ -320,7 +321,7 @@ export const verifyEmail = async (req, res) => {
   WHERE id = $1 AND email = $2
   LIMIT 1
   `,
-      [decoded.userId, decoded?.email],
+      [decoded.userId, decoded.email],
     );
 
     if (result.rowCount === 0) {
@@ -335,8 +336,8 @@ export const verifyEmail = async (req, res) => {
       `UPDATE users
        SET is_verified = TRUE,
            updated_at  = NOW()
-       WHERE id = $1 && email = $2`,
-      [decoded.userId, decoded?.email],
+       WHERE id = $1 AND email = $2`,
+      [decoded.userId, decoded.email],
     );
     await client.query("COMMIT");
 
@@ -345,6 +346,14 @@ export const verifyEmail = async (req, res) => {
     });
   } catch (error) {
     if (client) await client.query("ROLLBACK").catch(() => {});
+
+    // Handle JWT specific errors
+    if (error instanceof jwt.JsonWebTokenError) {
+      return res.status(StatusCodes.FORBIDDEN).json({
+        message: rMessage.invalid_verification_token,
+      });
+    }
+
     return res.status(StatusCodes.INTERNAL_SERVER_ERROR).json({
       message: rMessage.internal_server_error,
     });
@@ -353,3 +362,268 @@ export const verifyEmail = async (req, res) => {
   }
 };
 
+export const changePassword = async (req, res) => {
+  let client;
+
+  try {
+    const { current_password, new_password } = req?.body ?? {};
+    const userId = req.user?.userId;
+
+    // ── 1. Input presence check ────────────────────────────────────────────
+    if (!isValidString(current_password) || !isValidString(new_password)) {
+      return res.status(StatusCodes.BAD_REQUEST).json({
+        success: false,
+        message: rMessage.invalid_request,
+      });
+    }
+
+    const cleanCurrent = current_password.trim();
+    const cleanNew = new_password.trim();
+
+    if (!PATTERNS?.password.test(cleanNew)) {
+      return res.status(StatusCodes.BAD_REQUEST).json({
+        message: rMessage.invalid_new_password,
+      });
+    }
+
+    if (cleanCurrent === cleanNew) {
+      return res.status(StatusCodes.BAD_REQUEST).json({
+        message: rMessage.new_password_same_as_old,
+      });
+    }
+
+    client = await getClient();
+
+    const { rows } = await client.query(
+      `SELECT password_hash
+       FROM   users
+       WHERE  id = $1
+       LIMIT  1`,
+      [userId],
+    );
+
+    if (!rows.length) {
+      return res.status(StatusCodes.NOT_FOUND).json({
+        message: rMessage.user_not_found,
+      });
+    }
+
+    const { password_hash } = rows[0];
+
+    const isMatch = await bcrypt.compare(cleanCurrent, password_hash);
+
+    if (!isMatch) {
+      return res.status(StatusCodes.UNAUTHORIZED).json({
+        message: rMessage.incorrect_current_password,
+      });
+    }
+
+    const isSameAsStored = await bcrypt.compare(cleanNew, password_hash);
+
+    if (isSameAsStored) {
+      return res.status(StatusCodes.BAD_REQUEST).json({
+        message: rMessage.new_password_same_as_old,
+      });
+    }
+
+    const new_password_hash = await bcrypt.hash(cleanNew, SALT_ROUNDS);
+
+    await client.query(
+      `UPDATE users
+       SET    password_hash = $1,
+              updated_at    = NOW()
+       WHERE  id = $2`,
+      [new_password_hash, userId],
+    );
+
+    return res.status(StatusCodes.OK).json({
+      message: rMessage.password_changed_success,
+    });
+  } catch (error) {
+    return res.status(StatusCodes.INTERNAL_SERVER_ERROR).json({
+      message: rMessage.internal_server_error,
+    });
+  } finally {
+    if (client) client.release();
+  }
+};
+
+export const updateProfile = async (req, res) => {
+  let client;
+
+  const ALLOWED_UPDATE_FIELDS = new Set([
+    "full_name",
+    "bio",
+    "website_url",
+    "profile_photo",
+  ]);
+
+  const LIMITS = {
+    full_name_min: 2,
+    full_name_max: 100,
+    bio_max: 300,
+  };
+
+  const isValidUrl = (value) => {
+    try {
+      const parsed = new URL(value.trim());
+      return ["http:", "https:"].includes(parsed.protocol);
+    } catch {
+      return false;
+    }
+  };
+
+  try {
+    const userId = req.user?.userId;
+
+    const fields = req.formFields ?? {};
+    const files = req.formFiles ?? {};
+
+    const unknownFields = Object.keys(fields).filter(
+      (key) => !ALLOWED_UPDATE_FIELDS.has(key),
+    );
+
+    if (unknownFields.length > 0) {
+      return res.status(StatusCodes.BAD_REQUEST).json({
+        message: rMessage.unknown_update_fields,
+        meta: { unknownFields },
+      });
+    }
+
+    const hasTextFields = Object.keys(fields).some((key) =>
+      ALLOWED_UPDATE_FIELDS.has(key),
+    );
+    const hasFileFields = "profile_photo" in files;
+
+    if (!hasTextFields && !hasFileFields) {
+      return res.status(StatusCodes.BAD_REQUEST).json({
+        message: rMessage.no_update_fields,
+      });
+    }
+
+    const errors = {};
+    const sanitised = {};
+
+    if ("full_name" in fields) {
+      const val = fields.full_name;
+
+      if (val === null) {
+        sanitised.full_name = null;
+      } else if (!isValidString(val)) {
+        errors.full_name = rMessage.full_name_invalid;
+      } else {
+        const trimmed = val.trim();
+        const namePattern = /^[\p{L}\s'\-.]{2,100}$/u;
+
+        if (
+          trimmed.length < LIMITS.full_name_min ||
+          trimmed.length > LIMITS.full_name_max ||
+          !namePattern.test(trimmed)
+        ) {
+          errors.full_name = rMessage.full_name_invalid;
+        } else {
+          sanitised.full_name = trimmed;
+        }
+      }
+    }
+
+    if ("bio" in fields) {
+      const val = fields.bio;
+
+      if (val === null) {
+        sanitised.bio = null;
+      } else if (!isValidString(val)) {
+        errors.bio = rMessage.bio_too_long;
+      } else {
+        const trimmed = val.trim();
+
+        if (trimmed.length > LIMITS.bio_max) {
+          errors.bio = rMessage.bio_too_long;
+        } else {
+          sanitised.bio = trimmed;
+        }
+      }
+    }
+
+    if ("website_url" in fields) {
+      const val = fields.website_url;
+
+      if (val === null) {
+        sanitised.website_url = null;
+      } else if (!isValidString(val) || !isValidUrl(val)) {
+        errors.website_url = rMessage.invalid_url;
+      } else {
+        sanitised.website_url = new URL(val.trim()).href;
+      }
+    }
+
+    if ("profile_photo" in files) {
+      const file = files.profile_photo;
+
+      try {
+        sanitised.profile_photo_url = await validateAndSaveFile(file, {
+          folder: "UserProfile",
+          allowedMimeTypes: ["image/png", "image/jpeg", "image/webp"],
+          maxSizeMB: 5,
+        });
+      } catch (uploadError) {
+        errors.profile_photo =
+          uploadError.message ?? rMessage.profile_photo_invalid;
+      }
+    }
+
+    if (Object.keys(errors).length > 0) {
+      return res.status(StatusCodes.BAD_REQUEST).json({
+        message: rMessage.invalid_request,
+      });
+    }
+
+    const setClauses = [];
+    const values = [];
+    let paramIndex = 1;
+
+    for (const [column, value] of Object.entries(sanitised)) {
+      setClauses.push(`${column} = $${paramIndex}`);
+      values.push(value);
+      paramIndex++;
+    }
+
+    setClauses.push(`updated_at = NOW()`);
+    values.push(userId);
+
+    client = await getClient();
+
+    const { rows } = await client.query(
+      `UPDATE users
+       SET ${setClauses.join(", ")}
+       WHERE id = $${paramIndex}
+       RETURNING
+         id,
+         username,
+         email,
+         full_name,
+         bio,
+         website_url,
+         profile_photo_url,
+         updated_at`,
+      values,
+    );
+
+    if (!rows.length) {
+      return res.status(StatusCodes.NOT_FOUND).json({
+        message: rMessage.user_not_found,
+      });
+    }
+
+    return res.status(StatusCodes.OK).json({
+      message: rMessage.profile_updated,
+      data: { user: rows[0] },
+    });
+  } catch (error) {
+    return res.status(StatusCodes.INTERNAL_SERVER_ERROR).json({
+      message: rMessage.internal_server_error,
+    });
+  } finally {
+    if (client) client.release();
+  }
+};
