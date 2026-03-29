@@ -627,3 +627,132 @@ export const updateProfile = async (req, res) => {
     if (client) client.release();
   }
 };
+
+export const getUsers = async (req, res) => {
+  let client;
+
+  try {
+    const userId = req.user?.userId;
+    if (!userId || !isValiduuid(userId)) {
+      return res.status(StatusCodes.NOT_ACCEPTABLE).json({
+        success: false,
+        message: rMessage.invalid_request,
+        data: null,
+      });
+    }
+    const page = Math.max(parseInt(req.query.page) || 1, 1);
+    const limit = Math.max(parseInt(req.query.limit) || 10, 1);
+    const sort = req.query.sort === "asc" ? "ASC" : "DESC";
+    const search = req.query.search?.trim() || null;
+
+    const offset = (page - 1) * limit;
+
+    client = await getClient();
+
+    let query = `
+      SELECT id, username, email, full_name, bio, website_url, profile_photo_url, is_active, is_verified, created_at
+      FROM users
+    `;
+    const values = [];
+
+    if (search) {
+      query += ` WHERE username ILIKE $1 OR email ILIKE $1 OR full_name ILIKE $1`;
+      values.push(`%${search}%`);
+    }
+
+    query += ` ORDER BY created_at ${sort} LIMIT $${values.length + 1} OFFSET $${values.length + 2}`;
+    values.push(limit, offset);
+
+    const { rows } = await client.query(query, values);
+
+    // Total count for pagination
+    let countQuery = "SELECT COUNT(*) AS total FROM users";
+    if (search)
+      countQuery += ` WHERE username ILIKE $1 OR email ILIKE $1 OR full_name ILIKE $1`;
+    const { rows: countRows } = await client.query(
+      countQuery,
+      search ? [`%${search}%`] : [],
+    );
+    const total = parseInt(countRows[0].total);
+
+    return res.status(StatusCodes.OK).json({
+      success: true,
+      message: rMessage.success,
+      data: {
+        users: rows,
+        pagination: {
+          page,
+          limit,
+          total,
+          totalPages: Math.ceil(total / limit),
+        },
+      },
+    });
+  } catch (error) {
+    console.error("getUsers error:", error);
+    return res.status(StatusCodes.INTERNAL_SERVER_ERROR).json({
+      success: false,
+      message: rMessage.internal_server_error,
+      data: null,
+    });
+  } finally {
+    if (client) client.release();
+  }
+};
+
+export const getUser = async (req, res) => {
+  let client;
+
+  try {
+    const userId = req.user?.userId;
+    if (!userId || !isValiduuid(userId)) {
+      return res.status(StatusCodes.NOT_ACCEPTABLE).json({
+        success: false,
+        message: rMessage.invalid_request,
+        data: null,
+      });
+    }
+
+    const identifier = req.params?.id?.trim();
+    if (!identifier) {
+      return res.status(StatusCodes.BAD_REQUEST).json({
+        success: false,
+        message: rMessage.invalid_request,
+        data: null,
+      });
+    }
+
+    client = await getClient();
+
+    let query = `
+      SELECT id, username, email, full_name, bio, website_url, profile_photo_url, is_active, is_verified, created_at, updated_at
+      FROM users
+      WHERE id = $1 OR username = $1
+      LIMIT 1
+    `;
+    const { rows } = await client.query(query, [identifier]);
+
+    if (!rows.length) {
+      return res.status(StatusCodes.NOT_FOUND).json({
+        success: false,
+        message: rMessage.user_not_found,
+        data: null,
+      });
+    }
+
+    return res.status(StatusCodes.OK).json({
+      success: true,
+      message: rMessage.success,
+      data: { user: rows[0] },
+    });
+  } catch (error) {
+    console.error("getUser error:", error);
+    return res.status(StatusCodes.INTERNAL_SERVER_ERROR).json({
+      success: false,
+      message: rMessage.internal_server_error,
+      data: null,
+    });
+  } finally {
+    if (client) client.release();
+  }
+};

@@ -35,6 +35,8 @@ export const rMessage = {
   operation_failed: "The operation could not be completed. Please try again.",
   internal_server_error:
     "An unexpected error occurred on our end. Please try again later.",
+  server_error:
+    "An unexpected error occurred on our end. Please try again later.",
   service_unavailable:
     "The service is temporarily unavailable. Please check back shortly.",
   request_timeout: "The request timed out. Please try again.",
@@ -106,4 +108,25 @@ export const rMessage = {
   author_not_found: "The requested author could not be found.",
 
   author_already_exists: "An author with the same identifier already exists.",
+  author_photo_invalid:
+    "Author photo must be a valid image file (PNG, JPEG, WebP) and under 5MB.",
+  category_name_required: "Category name is required.",
+  category_name_length: "Category name must not exceed 120 characters.",
+  category_slug_required: "Category slug is required.",
+  category_slug_length: "Category slug must not exceed 120 characters.",
+  category_slug_exists: "Category slug already exists.",
+  category_name_exists: "Category name already exists.",
+  category_not_found: "Category not found.",
+  category_parent_invalid: "Parent category does not exist.",
+  category_parent_self: "Category cannot be its own parent.",
+  category_color_invalid: "Color must be a valid HEX format (#FFFFFF).",
+  category_icon_invalid:
+    "Category icon must be a valid URL starting with http:// or https://.",
+  category_description_invalid: "Category description must be a valid string.",
+  category_created_success: "Category has been successfully created.",
+  category_updated_success: "Category has been successfully updated.",
+  category_deleted_success: "Category has been successfully removed.",
+  success: "Request processed successfully.",
+  invalid_request:
+    "The request could not be processed because it contains invalid, incomplete, or malformed data.",
 };
